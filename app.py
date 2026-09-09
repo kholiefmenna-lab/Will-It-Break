@@ -444,6 +444,7 @@ def load_registered_models(db_path):
     repair_mlflow_paths(db_path)
     mlflow.set_tracking_uri(f"sqlite:///{db_path}")
     client = mlflow.MlflowClient()
+    
 
     names = {
         "binary": "failure_within_24h_classifier",
@@ -453,13 +454,34 @@ def load_registered_models(db_path):
 
     models = {}
     versions = {}
+
     for key, name in names.items():
         try:
-            models[key] = mlflow.sklearn.load_model(f"models:/{name}@staging")
-            versions[key] = client.get_model_version_by_alias(name, "staging").version
-        except Exception:
+            registered_versions = client.search_model_versions(f"name='{name}'")
+
+            if not registered_versions:
+                models[key] = None
+                versions[key] = None
+                continue
+
+            # Use the latest registered version
+            latest_version = max(
+                registered_versions,
+                key=lambda v: int(v.version)
+            )
+
+            version = latest_version.version
+
+            models[key] = mlflow.sklearn.load_model(
+                f"models:/{name}/{version}"
+            )
+
+            versions[key] = version
+
+        except Exception as e:
             models[key] = None
             versions[key] = None
+            st.warning(f"Could not load {name}: {e}")
 
     return models["binary"], models["multiclass"], models["rul"], versions
 
