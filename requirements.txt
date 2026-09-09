@@ -4,4 +4,4 @@ numpy==2.2.6
 plotly>=5.22,<7
 scikit-learn==1.7.2
 xgboost==3.2.0
-mlflow==3.15.2
+mlflow==3.16.0
