@@ -1,0 +1,18 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.ipynb_checkpoints/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# MLflow local runs folder (contains files >240MB that exceed GitHub's 100MB limit)
+# Note: The 3 trained models are safely packaged inside models/ (.joblib format < 55MB)
+mlruns/
+
+# System files
+.DS_Store
+Thumbs.db
