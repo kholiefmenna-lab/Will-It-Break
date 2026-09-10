@@ -1101,11 +1101,13 @@ elif page == "MLflow":
     st.markdown("""
     <div class="info-box">
         <b>Experiment Tracking & Model Registry</b><br>
-        This dashboard shows the experiments, model performance, tracked metrics,
-        and registered model versions used in the <b>Will It Break?</b> project.
+        This section summarizes the MLflow experiments, tracked metrics, and registered
+        model versions used in the <b>Will It Break?</b> predictive-maintenance project.
     </div>
     """, unsafe_allow_html=True)
 
+    # Cloud-safe MLflow dashboard: prediction models are bundled for deployment,
+    # while the full SQLite tracking backend remains available in the local project.
     c1, c2, c3 = st.columns(3)
     with c1:
         metric_card("Experiments", "3")
@@ -1114,55 +1116,13 @@ elif page == "MLflow":
     with c3:
         metric_card("Registered Models", "3")
 
-    st.markdown("### Experiment Overview")
+    st.markdown("### Experiments")
     experiments = pd.DataFrame([
         ["Failure Within 24h", "Binary Classification", "Recall + F1", "XGBoost"],
         ["Failure Type", "Multi-class Classification", "Macro Recall + Macro F1", "XGBoost"],
         ["RUL Hours", "Regression", "MAE + R²", "Random Forest"],
     ], columns=["Experiment", "Task", "Selection Metrics", "Best Model"])
     st.dataframe(experiments, use_container_width=True, hide_index=True)
-
-    st.markdown("### Classification Model Performance")
-    classification_chart = pd.DataFrame([
-        ["Failure Within 24h", "Accuracy", 98.96],
-        ["Failure Within 24h", "Recall", 98.88],
-        ["Failure Within 24h", "F1", 96.57],
-        ["Failure Type", "Accuracy", 98.92],
-        ["Failure Type", "Macro Recall", 98.77],
-        ["Failure Type", "Macro F1", 96.96],
-    ], columns=["Experiment", "Metric", "Score"])
-
-    fig_class = px.bar(
-        classification_chart, x="Experiment", y="Score",
-        color="Metric", barmode="group", text="Score",
-        labels={"Score": "Score (%)"},
-    )
-    fig_class.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-    fig_class.update_yaxes(range=[90, 101])
-    fig_class.update_layout(height=420, margin=dict(l=20, r=20, t=30, b=20))
-    st.plotly_chart(fig_class, use_container_width=True)
-
-    st.markdown("### RUL Regression Performance")
-    rul_chart = pd.DataFrame([
-        ["MAE", 1.64],
-        ["RMSE", 3.96],
-    ], columns=["Metric", "Value"])
-
-    fig_rul = px.bar(
-        rul_chart, x="Metric", y="Value", text="Value",
-        labels={"Value": "Hours"},
-    )
-    fig_rul.update_traces(texttemplate="%{text:.2f} h", textposition="outside")
-    fig_rul.update_layout(height=350, margin=dict(l=20, r=20, t=30, b=20), showlegend=False)
-    st.plotly_chart(fig_rul, use_container_width=True)
-
-    r1, r2, r3 = st.columns(3)
-    with r1:
-        metric_card("RUL MAE", "1.64 h")
-    with r2:
-        metric_card("RUL RMSE", "3.96 h")
-    with r3:
-        metric_card("RUL R²", "97.7%")
 
     st.markdown("### Registered Model Registry")
     registry = pd.DataFrame([
@@ -1172,30 +1132,15 @@ elif page == "MLflow":
     ], columns=["Registered Model", "Version", "Model", "Task", "Deployment"])
     st.dataframe(registry, use_container_width=True, hide_index=True)
 
-    st.markdown("### Registered Model Versions")
-    registry_chart = pd.DataFrame([
-        ["Failure Within 24h", 2],
-        ["Failure Type", 1],
-        ["RUL Hours", 1],
-    ], columns=["Model", "Version"])
-
-    fig_registry = px.bar(
-        registry_chart, x="Model", y="Version", text="Version",
-        labels={"Version": "Registered Version"},
-    )
-    fig_registry.update_traces(textposition="outside")
-    fig_registry.update_yaxes(dtick=1, rangemode="tozero")
-    fig_registry.update_layout(height=330, margin=dict(l=20, r=20, t=30, b=20), showlegend=False)
-    st.plotly_chart(fig_registry, use_container_width=True)
-
     st.markdown("### Tracked Evaluation Metrics")
     metric_data = pd.DataFrame([
         ["Failure Within 24h", "XGBoost", "98.9%", "98.9%", "96.9%", "—"],
         ["Failure Type", "XGBoost", "98.9%", "98.6%", "96.9%", "—"],
-        ["RUL Hours", "Random Forest", "—", "—", "—", "MAE 1.64 h · RMSE 3.96 h · R² 0.977"],
+        ["RUL Hours", "Random Forest", "—", "—", "—", "MAE 1.64 h · R² 0.977"],
     ], columns=["Experiment", "Best Model", "Accuracy", "Recall / Macro Recall", "F1 / Macro F1", "Regression Metrics"])
     st.dataframe(metric_data, use_container_width=True, hide_index=True)
 
+    # Show the real MLflow run data when the local SQLite backend is available.
     if db_path:
         st.success(f"Connected to local MLflow backend: {db_path.name}")
         mlflow.set_tracking_uri(f"sqlite:///{db_path}")
@@ -1232,9 +1177,9 @@ elif page == "MLflow":
                 st.dataframe(view, use_container_width=True, hide_index=True)
     else:
         st.info(
-            "Cloud deployment: the prediction models are loaded from bundled model files. "
-            "This page still presents the project's MLflow experiments, performance metrics, "
-            "and registered model versions for users."
+            "Cloud deployment: the prediction models are loaded from the bundled model files, "
+            "while this page displays the project's MLflow experiment and registry summary. "
+            "The full MLflow SQLite tracking backend is available when running the project locally."
         )
 
     st.caption(
