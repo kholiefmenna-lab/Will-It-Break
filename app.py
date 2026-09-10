@@ -1,7 +1,10 @@
 
 import os
 import sqlite3
+import tempfile
 from pathlib import Path
+
+import joblib
 
 import mlflow
 import mlflow.sklearn
@@ -434,56 +437,111 @@ def repair_mlflow_paths(db_path):
         con.close()
 
 
+def _load_bundled_models():
+    """
+    Deployment fallback: Streamlit Cloud does not have the local MLflow SQLite
+    registry, so load the same registered model versions from compact joblib files.
+    Local runs still use the MLflow registry below when mlflow_test.db exists.
+    """
+    model_dir = BASE / "models"
+
+    binary_path = model_dir / "failure_within_24h_classifier.joblib"
+    mc_path = model_dir / "failure_type_classifier.joblib"
+
+    # The RUL model is ~54 MB even after joblib compression, so it is split into
+    # GitHub-uploadable chunks and reconstructed into the temporary directory.
+    rul_path = Path(tempfile.gettempdir()) / "will_it_break_rul_hours_regressor.joblib"
+    rul_chunks = sorted(model_dir.glob("rul_hours_regressor.joblib.part*"))
+
+    if not binary_path.exists() or not mc_path.exists() or not rul_chunks:
+        return None, None, None, {}
+
+    try:
+        if not rul_path.exists() or rul_path.stat().st_size != sum(p.stat().st_size for p in rul_chunks):
+            with open(rul_path, "wb") as out:
+                for chunk in rul_chunks:
+                    with open(chunk, "rb") as src:
+                        while True:
+                            block = src.read(1024 * 1024)
+                            if not block:
+                                break
+                            out.write(block)
+
+        binary = joblib.load(binary_path)
+        multiclass = joblib.load(mc_path)
+        rul = joblib.load(rul_path)
+
+        return binary, multiclass, rul, {
+            "binary": "2 (bundled)",
+            "multiclass": "1 (bundled)",
+            "rul": "1 (bundled)",
+        }
+    except Exception as e:
+        st.warning(f"Could not load bundled prediction models: {e}")
+        return None, None, None, {}
+
+
 @st.cache_resource(show_spinner=False)
 def load_registered_models(db_path):
+    # Streamlit Cloud: there is no local MLflow SQLite registry, so use the
+    # bundled model files immediately when the DB is not present.
     if not db_path:
-        return None, None, None, None
+        return _load_bundled_models()
 
-    # The DB shipped with the project contains paths from the training PC.
-    # Rewrite those paths to the current app folder before MLflow resolves the aliases.
-    repair_mlflow_paths(db_path)
-    mlflow.set_tracking_uri(f"sqlite:///{db_path}")
-    client = mlflow.MlflowClient()
-    
-
-    names = {
-        "binary": "failure_within_24h_classifier",
-        "multiclass": "failure_type_classifier",
-        "rul": "rul_hours_regressor",
-    }
-
-    models = {}
-    versions = {}
-
-    for key, name in names.items():
+    # Local development: use the MLflow registry exactly as before.
+    if db_path:
         try:
-            registered_versions = client.search_model_versions(f"name='{name}'")
+            # The DB shipped with the project contains paths from the training PC.
+            # Rewrite those paths to the current app folder before MLflow resolves the aliases.
+            repair_mlflow_paths(db_path)
+            mlflow.set_tracking_uri(f"sqlite:///{db_path}")
+            client = mlflow.MlflowClient()
 
-            if not registered_versions:
-                models[key] = None
-                versions[key] = None
-                continue
+            names = {
+                "binary": "failure_within_24h_classifier",
+                "multiclass": "failure_type_classifier",
+                "rul": "rul_hours_regressor",
+            }
 
-            # Use the latest registered version
-            latest_version = max(
-                registered_versions,
-                key=lambda v: int(v.version)
-            )
+            models = {}
+            versions = {}
 
-            version = latest_version.version
+            for key, name in names.items():
+                try:
+                    registered_versions = client.search_model_versions(f"name='{name}'")
 
-            models[key] = mlflow.sklearn.load_model(
-                f"models:/{name}/{version}"
-            )
+                    if not registered_versions:
+                        models[key] = None
+                        versions[key] = None
+                        continue
 
-            versions[key] = version
+                    # Use the latest registered version.
+                    latest_version = max(
+                        registered_versions,
+                        key=lambda v: int(v.version)
+                    )
+
+                    version = latest_version.version
+
+                    models[key] = mlflow.sklearn.load_model(
+                        f"models:/{name}/{version}"
+                    )
+
+                    versions[key] = version
+
+                except Exception as e:
+                    models[key] = None
+                    versions[key] = None
+                    st.warning(f"Could not load {name}: {e}")
+
+            if any(models.values()):
+                return models["binary"], models["multiclass"], models["rul"], versions
 
         except Exception as e:
-            models[key] = None
-            versions[key] = None
-            st.warning(f"Could not load {name}: {e}")
+            st.warning(f"MLflow registry unavailable; using bundled models instead. Details: {e}")
 
-    return models["binary"], models["multiclass"], models["rul"], versions
+    # Streamlit Cloud: no local SQLite registry is required.
+    return _load_bundled_models()
 
 
 # --------------------------- Charts ---------------------------
@@ -1040,9 +1098,50 @@ elif page == "Model Evaluation":
 elif page == "MLflow":
     st.markdown('<div class="section-title">MLflow Experiment Tracking</div>', unsafe_allow_html=True)
 
-    if not db_path:
-        st.warning("mlflow.db was not found beside app.py. Run the notebook through its MLflow section first. The dashboard is designed to read the same SQLite tracking backend.")
-    else:
+    st.markdown("""
+    <div class="info-box">
+        <b>Experiment Tracking & Model Registry</b><br>
+        This section summarizes the MLflow experiments, tracked metrics, and registered
+        model versions used in the <b>Will It Break?</b> predictive-maintenance project.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Cloud-safe MLflow dashboard: prediction models are bundled for deployment,
+    # while the full SQLite tracking backend remains available in the local project.
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        metric_card("Experiments", "3")
+    with c2:
+        metric_card("Tracked Runs", "10")
+    with c3:
+        metric_card("Registered Models", "3")
+
+    st.markdown("### Experiments")
+    experiments = pd.DataFrame([
+        ["Failure Within 24h", "Binary Classification", "Recall + F1", "XGBoost"],
+        ["Failure Type", "Multi-class Classification", "Macro Recall + Macro F1", "XGBoost"],
+        ["RUL Hours", "Regression", "MAE + R²", "Random Forest"],
+    ], columns=["Experiment", "Task", "Selection Metrics", "Best Model"])
+    st.dataframe(experiments, use_container_width=True, hide_index=True)
+
+    st.markdown("### Registered Model Registry")
+    registry = pd.DataFrame([
+        ["failure_within_24h_classifier", "2", "XGBoost", "Binary classification", "Bundled for Cloud"],
+        ["failure_type_classifier", "1", "XGBoost", "5-class classification", "Bundled for Cloud"],
+        ["rul_hours_regressor", "1", "Random Forest", "RUL regression", "Bundled for Cloud"],
+    ], columns=["Registered Model", "Version", "Model", "Task", "Deployment"])
+    st.dataframe(registry, use_container_width=True, hide_index=True)
+
+    st.markdown("### Tracked Evaluation Metrics")
+    metric_data = pd.DataFrame([
+        ["Failure Within 24h", "XGBoost", "98.9%", "98.9%", "96.9%", "—"],
+        ["Failure Type", "XGBoost", "98.9%", "98.6%", "96.9%", "—"],
+        ["RUL Hours", "Random Forest", "—", "—", "—", "MAE 1.64 h · R² 0.977"],
+    ], columns=["Experiment", "Best Model", "Accuracy", "Recall / Macro Recall", "F1 / Macro F1", "Regression Metrics"])
+    st.dataframe(metric_data, use_container_width=True, hide_index=True)
+
+    # Show the real MLflow run data when the local SQLite backend is available.
+    if db_path:
         st.success(f"Connected to local MLflow backend: {db_path.name}")
         mlflow.set_tracking_uri(f"sqlite:///{db_path}")
         client = mlflow.MlflowClient()
@@ -1053,58 +1152,41 @@ elif page == "MLflow":
             "predictive_maintenance_rul_hours",
         ]
 
-        for exp_name in experiment_names:
-            exp = mlflow.get_experiment_by_name(exp_name)
-            if exp is None:
-                continue
+        with st.expander("View local MLflow run details", expanded=False):
+            for exp_name in experiment_names:
+                exp = mlflow.get_experiment_by_name(exp_name)
+                if exp is None:
+                    continue
 
-            st.markdown(f"### {exp_name}")
-            runs = mlflow.search_runs(experiment_ids=[exp.experiment_id])
+                st.markdown(f"#### {exp_name}")
+                runs = mlflow.search_runs(experiment_ids=[exp.experiment_id])
+                if runs.empty:
+                    st.caption("No runs found.")
+                    continue
 
-            if runs.empty:
-                st.caption("No runs found.")
-                continue
+                preferred = [c for c in [
+                    "tags.mlflow.runName", "metrics.test_accuracy",
+                    "metrics.test_precision", "metrics.test_recall",
+                    "metrics.test_f1", "metrics.test_recall_macro",
+                    "metrics.test_f1_macro", "metrics.test_mae",
+                    "metrics.test_rmse", "metrics.test_r2",
+                ] if c in runs.columns]
 
-            preferred = [c for c in [
-                "tags.mlflow.runName", "metrics.test_accuracy",
-                "metrics.test_precision", "metrics.test_recall",
-                "metrics.test_f1", "metrics.test_recall_macro",
-                "metrics.test_f1_macro", "metrics.test_mae",
-                "metrics.test_rmse", "metrics.test_r2",
-            ] if c in runs.columns]
+                view = runs[preferred].copy()
+                view.columns = [c.replace("metrics.", "").replace("tags.mlflow.", "") for c in view.columns]
+                st.dataframe(view, use_container_width=True, hide_index=True)
+    else:
+        st.info(
+            "Cloud deployment: the prediction models are loaded from the bundled model files, "
+            "while this page displays the project's MLflow experiment and registry summary. "
+            "The full MLflow SQLite tracking backend is available when running the project locally."
+        )
 
-            view = runs[preferred].copy()
-            view.columns = [c.replace("metrics.", "").replace("tags.mlflow.", "") for c in view.columns]
-            st.dataframe(view, use_container_width=True)
-
-            # Visualize the most relevant test metric per experiment.
-            if "failure_24h" in exp_name:
-                metric_cols = [c for c in ["test_accuracy", "test_precision", "test_recall", "test_f1"] if c in view]
-            elif "failure_type" in exp_name:
-                metric_cols = [c for c in ["test_accuracy", "test_recall_macro", "test_f1_macro"] if c in view]
-            else:
-                metric_cols = [c for c in ["test_mae", "test_rmse", "test_r2"] if c in view]
-
-            if metric_cols and "runName" in view:
-                long = view.melt(id_vars=["runName"], value_vars=metric_cols, var_name="Metric", value_name="Value")
-                fig = px.bar(long, x="runName", y="Value", color="Metric", barmode="group", title="MLflow Test Metric Comparison")
-                st.plotly_chart(fig_layout(fig, 410), use_container_width=True)
-
-        st.markdown("### Registered Models")
-        reg_rows = []
-        for name in [
-            "failure_within_24h_classifier",
-            "failure_type_classifier",
-            "rul_hours_regressor",
-        ]:
-            try:
-                v = client.get_model_version_by_alias(name, "staging")
-                reg_rows.append([name, v.version, "staging", v.run_id])
-            except Exception:
-                reg_rows.append([name, "—", "not available", "—"])
-        st.dataframe(pd.DataFrame(reg_rows, columns=["Registered Model", "Version", "Alias", "Source Run"]), use_container_width=True)
-
-        st.caption("The project reports 10 MLflow runs across 3 experiments, with hyperparameters, metrics, plots and serialized models logged. Best models are registered under the staging alias.")
+    st.caption(
+        "MLflow was used to track experiments, hyperparameters, evaluation metrics, plots, "
+        "and serialized models. The Cloud deployment keeps the registered model versions "
+        "available through bundled artifacts so live predictions remain fully functional."
+    )
 
 # --------------------------- Footer ---------------------------
 st.divider()
