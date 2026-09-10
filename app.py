@@ -790,9 +790,9 @@ elif page == "Live Predictions":
             # Build the live feature row using the SAME preprocessing/feature
             # engineering sequence used by the training notebook.
             #
-            # IMPORTANT: do not take candidate = history.iloc[[-1]] before
-            # feature engineering. Doing that previously discarded the engineered
-            # columns and caused align_prediction_features() to fill them with 0.
+            # IMPORTANT: the live row is explicitly marked and selected AFTER feature engineering.
+            # This prevents timestamp ties from causing the app to predict on the
+            # historical latest row instead of the operator-entered values.
             # ------------------------------------------------------------------
             history = machine_rows.copy()
             if "timestamp" in history.columns:
@@ -806,7 +806,22 @@ elif page == "Live Predictions":
                 row[k] = v
             row["machine_id"] = selected_machine
 
-            # Append the operator's current reading as the newest observation.
+            # Explicitly mark the operator-entered row. Previously it inherited
+            # the exact same timestamp as the historical latest row. Because
+            # timestamp sorting can reorder ties, the app could select the old
+            # historical row instead of the values the operator entered.
+            row["_is_live_prediction"] = True
+
+            # Give the synthetic live observation a timestamp strictly after the
+            # historical latest reading so rolling/change features use it as the
+            # newest observation. The explicit marker below is still used to
+            # select the prediction row, so timestamp ties cannot break inference.
+            if "timestamp" in history.columns:
+                history["timestamp"] = pd.to_datetime(history["timestamp"], errors="coerce")
+                valid_ts = history["timestamp"].dropna()
+                if len(valid_ts):
+                    row["timestamp"] = valid_ts.max() + pd.Timedelta(seconds=1)
+
             history = pd.concat([history, pd.DataFrame([row])], ignore_index=True)
 
             # prepare_dataframe() reproduces the notebook's preprocessing:
@@ -817,7 +832,14 @@ elif page == "Live Predictions":
             if len(live_features) == 0:
                 st.error("Could not build the live feature row.")
             else:
-                candidate = live_features.iloc[[-1]].copy()
+                # Select the live row by its explicit marker, never by position.
+                live_mask = live_features["_is_live_prediction"].fillna(False).astype(bool)
+                if not live_mask.any():
+                    st.error("Could not identify the live prediction row after feature engineering.")
+                else:
+                    live_index = live_features.index[live_mask][-1]
+                    candidate = live_features.loc[[live_index]].copy()
+                    candidate = candidate.drop(columns=["_is_live_prediction"], errors="ignore")
 
                 # Get each model's own feature schema. All three models were
                 # trained from the same engineered feature table, but using each
