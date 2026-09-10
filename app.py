@@ -545,6 +545,16 @@ def load_registered_models(db_path):
 
 
 # --------------------------- Charts ---------------------------
+# IMPORTANT: This order comes from the LabelEncoder fitted in the training notebook.
+# LabelEncoder.classes_ was: bearing, electrical, hydraulic, motor_overheat, none.
+FAILURE_TYPE_CLASS_NAMES = [
+    "bearing",
+    "electrical",
+    "hydraulic",
+    "motor_overheat",
+    "none",
+]
+
 def align_prediction_features(df, expected_features):
     """
     Align live input with the exact feature schema expected by the trained model.
@@ -833,50 +843,120 @@ elif page == "Live Predictions":
                 # This one-hot encodes categorical context before selecting model columns.
                 X_live = align_prediction_features(candidate, model_features)
 
+                # Run all three models first so the UI can check whether their
+                # outputs agree before presenting the assessment.
+                pred = None
+                prob = None
+                mc_pred = None
+                label = None
+                rul = None
+
+                if binary_model is not None:
+                    pred = int(binary_model.predict(X_live)[0])
+                    prob = float(binary_model.predict_proba(X_live)[0, 1])
+
+                if mc_model is not None:
+                    mc_pred = mc_model.predict(X_live)[0]
+                    try:
+                        idx = int(mc_pred)
+                        label = (
+                            FAILURE_TYPE_CLASS_NAMES[idx]
+                            if 0 <= idx < len(FAILURE_TYPE_CLASS_NAMES)
+                            else str(mc_pred)
+                        )
+                    except Exception:
+                        label = str(mc_pred)
+
+                if rul_model is not None:
+                    # RUL model may have the same feature set; use its own names.
+                    rf = list(rul_model.feature_names_in_) if hasattr(rul_model, "feature_names_in_") else model_features
+                    X_r = candidate.copy()
+                    X_r = align_prediction_features(X_r, rf).apply(pd.to_numeric, errors="coerce").fillna(0)
+                    X_r.columns = [str(col) for col in X_r.columns]
+                    rul = max(0.0, float(rul_model.predict(X_r)[0]))
+
                 p1, p2, p3 = st.columns(3)
 
-                # 1) Binary
+                # 1) Binary failure risk
                 with p1:
-                    if binary_model is not None:
-                        pred = int(binary_model.predict(X_live)[0])
-                        prob = float(binary_model.predict_proba(X_live)[0, 1])
+                    if pred is not None and prob is not None:
                         if pred == 1:
-                            st.markdown(f'<div class="status-danger">⚠ FAILURE RISK<br><span style="font-size:26px">{prob*100:.1f}%</span> probability within 24h</div>', unsafe_allow_html=True)
+                            st.markdown(
+                                f'<div class="status-danger">⚠ FAILURE RISK<br>'
+                                f'<span style="font-size:26px">{prob*100:.2f}%</span> probability within 24h</div>',
+                                unsafe_allow_html=True,
+                            )
                         else:
-                            st.markdown(f'<div class="status-ok">✓ NORMAL<br><span style="font-size:26px">{prob*100:.1f}%</span> failure probability</div>', unsafe_allow_html=True)
+                            st.markdown(
+                                f'<div class="status-ok">✓ NORMAL<br>'
+                                f'<span style="font-size:26px">{prob*100:.2f}%</span> probability within 24h</div>',
+                                unsafe_allow_html=True,
+                            )
+                            st.caption(f"Raw classifier probability: {prob:.8f}")
                     else:
                         st.warning("Binary model unavailable.")
 
                 # 2) Failure type
                 with p2:
-                    if mc_model is not None:
-                        mc_pred = mc_model.predict(X_live)[0]
-                        try:
-                            # Classes are shown in the project presentation.
-                            class_names = ["none", "bearing", "motor overheat", "hydraulic", "electrical"]
-                            idx = int(mc_pred)
-                            label = class_names[idx] if idx < len(class_names) else str(mc_pred)
-                        except Exception:
-                            label = str(mc_pred)
-                        st.markdown(f'<div class="metric-card"><div class="metric-label">Predicted Failure Type</div><div class="metric-value">{label.title()}</div><div class="metric-sub">XGBoost multi-class</div></div>', unsafe_allow_html=True)
+                    if label is not None:
+                        # The multiclass model includes `none`. When the binary
+                        # classifier says no near-term failure, make that context
+                        # explicit instead of implying a confirmed failure type.
+                        if label == "none" or pred == 0:
+                            display_label = "No failure predicted"
+                            sub_label = f"Multi-class model: {label.replace('_', ' ').title()}"
+                        else:
+                            display_label = label.replace('_', ' ').title()
+                            sub_label = "XGBoost multi-class"
+
+                        st.markdown(
+                            f'<div class="metric-card"><div class="metric-label">Predicted Failure Type</div>'
+                            f'<div class="metric-value">{display_label}</div>'
+                            f'<div class="metric-sub">{sub_label}</div></div>',
+                            unsafe_allow_html=True,
+                        )
                     else:
                         st.warning("Multi-class model unavailable.")
 
                 # 3) RUL
                 with p3:
-                    if rul_model is not None:
-                        # RUL model may have the same feature set; use its own names.
-                        rf = list(rul_model.feature_names_in_) if hasattr(rul_model, "feature_names_in_") else model_features
-                        X_r = candidate.copy()
-                        X_r = align_prediction_features(X_r, rf).apply(pd.to_numeric, errors="coerce").fillna(0)
-                        # Convert all feature names explicitly to Python string type
-                        # to avoid the scikit-learn mixed feature-name error.
-                        X_r.columns = [str(col) for col in X_r.columns]
-                        # Equivalent alternative: X_r.columns = X_r.columns.astype(str)
-                        rul = max(0.0, float(rul_model.predict(X_r)[0]))
-                        st.markdown(f'<div class="metric-card"><div class="metric-label">Remaining Useful Life</div><div class="metric-value">{rul:.1f} h</div><div class="metric-sub">Random Forest regression</div></div>', unsafe_allow_html=True)
+                    if rul is not None:
+                        st.markdown(
+                            f'<div class="metric-card"><div class="metric-label">Remaining Useful Life</div>'
+                            f'<div class="metric-value">{rul:.1f} h</div>'
+                            f'<div class="metric-sub">Random Forest regression</div></div>',
+                            unsafe_allow_html=True,
+                        )
                     else:
                         st.warning("RUL model unavailable.")
+
+                # ---------------- Model consistency check ----------------
+                # The binary target is explicitly "failure within 24h", while RUL
+                # is an independent regression model. They can disagree, so do not
+                # overwrite either model's output. Instead, surface the disagreement.
+                if pred is not None and prob is not None and rul is not None:
+                    rul_implies_failure_24h = rul <= 24.0
+                    classifier_implies_failure_24h = pred == 1
+
+                    if rul_implies_failure_24h != classifier_implies_failure_24h:
+                        st.markdown(
+                            f'<div class="consistency-warning">'
+                            f'<b>⚠ MODEL DISAGREEMENT</b><br>'
+                            f'24h classifier: <b>{prob*100:.2f}%</b> failure probability · '
+                            f'RUL model: <b>{rul:.1f} h</b> remaining.<br>'
+                            f'The models are predicting different near-term risk states. '
+                            f'Treat this case as requiring review rather than as a single definitive prediction.'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        state = "failure risk within 24h" if classifier_implies_failure_24h else "no failure within 24h"
+                        st.markdown(
+                            f'<div class="consistency-ok">'
+                            f'<b>✓ MODELS CONSISTENT</b> · Both models indicate <b>{state}</b>.'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
 
                 st.markdown("### Input Signal Profile")
                 signal_cols = [c for c in numeric_inputs if c in values]
