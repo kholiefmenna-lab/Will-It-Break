@@ -1,13 +1,9 @@
 
 import os
-import sqlite3
-import tempfile
 from pathlib import Path
 
 import joblib
 
-import mlflow
-import mlflow.sklearn
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -312,6 +308,8 @@ DATA_CANDIDATES = [
     BASE / "dataset" / "predictive_maintenance_v3.csv",
 ]
 MLFLOW_DB = BASE / "mlflow_test.db"
+MODEL_DIR = BASE / "models"
+MODEL_METADATA = BASE / "model_metadata.json"
 
 
 @st.cache_data(show_spinner=False)
@@ -390,161 +388,55 @@ def prepare_dataframe(raw):
 
 
 def locate_model_db():
-    return MLFLOW_DB if MLFLOW_DB.exists() else None
-
-
-def repair_mlflow_paths(db_path):
-    """Make the bundled MLflow registry portable after moving the project folder."""
-    if not db_path or not Path(db_path).exists():
-        return
-
-    root = Path(db_path).resolve().parent
-    mlruns = root / "mlruns"
-    mapping = {
-        ("failure_within_24h_classifier", 1): (1, "293c17ca33d54751809fda0d0499a230", "6328aa65dcfe47a09b7ad0f75f01e005"),
-        ("failure_within_24h_classifier", 2): (1, "f511d12e08744e078b3109ea10e1e335", "563489b3c39c441abd86c5acff82ce94"),
-        ("rul_hours_regressor", 1): (2, "e28dfb3078d24b958c7489058a61d911", "6ac275f4e51f4149986a74b8cc9109b3"),
-        ("failure_type_classifier", 1): (3, "01aad14449724d55899586a58f3cbbf5", "62e648d820ad4c409a82c95ab9e1911b"),
-    }
-
-    con = sqlite3.connect(str(db_path))
-    try:
-        cur = con.cursor()
-        for eid in (0, 1, 2, 3):
-            exp_dir = (mlruns / str(eid)).resolve()
-            if exp_dir.exists():
-                cur.execute(
-                    "UPDATE experiments SET artifact_location=? WHERE experiment_id=?",
-                    (exp_dir.as_uri(), eid),
-                )
-
-        for (name, version), (eid, model_id, run_id) in mapping.items():
-            model_dir = (mlruns / str(eid) / "models" / f"m-{model_id}" / "artifacts").resolve()
-            if not (model_dir / "MLmodel").exists():
-                continue
-            source = model_dir.as_uri()
-            cur.execute(
-                "UPDATE model_versions SET source=?, storage_location=?, run_id=?, status='READY', status_message=NULL WHERE name=? AND version=?",
-                (source, source, run_id, name, version),
-            )
-
-        for eid, run_id in cur.execute("SELECT experiment_id, run_uuid FROM runs").fetchall():
-            run_dir = (mlruns / str(eid) / run_id / "artifacts").resolve()
-            if run_dir.exists():
-                cur.execute("UPDATE runs SET artifact_uri=? WHERE run_uuid=?", (run_dir.as_uri(), run_id))
-        con.commit()
-    finally:
-        con.close()
+    # The final deployment is self-contained; MLflow is optional and not required
+    # to run the prediction GUI.
+    return None
 
 
 def _load_bundled_models():
-    """
-    Deployment fallback: Streamlit Cloud does not have the local MLflow SQLite
-    registry, so load the same registered model versions from compact joblib files.
-    Local runs still use the MLflow registry below when mlflow_test.db exists.
-    """
-    model_dir = BASE / "models"
+    """Load the tested, self-contained prediction artifacts shipped with this app."""
+    binary_path = MODEL_DIR / "failure_within_24h_classifier.joblib"
+    mc_path = MODEL_DIR / "failure_type_classifier.joblib"
+    rul_path = MODEL_DIR / "rul_hours_regressor.joblib"
 
-    binary_path = model_dir / "failure_within_24h_classifier.joblib"
-    mc_path = model_dir / "failure_type_classifier.joblib"
-
-    # The RUL model is ~54 MB even after joblib compression, so it is split into
-    # GitHub-uploadable chunks and reconstructed into the temporary directory.
-    rul_path = Path(tempfile.gettempdir()) / "will_it_break_rul_hours_regressor.joblib"
-    rul_chunks = sorted(model_dir.glob("rul_hours_regressor.joblib.part*"))
-
-    if not binary_path.exists() or not mc_path.exists() or not rul_chunks:
+    if not (binary_path.exists() and mc_path.exists() and rul_path.exists()):
         return None, None, None, {}
 
     try:
-        if not rul_path.exists() or rul_path.stat().st_size != sum(p.stat().st_size for p in rul_chunks):
-            with open(rul_path, "wb") as out:
-                for chunk in rul_chunks:
-                    with open(chunk, "rb") as src:
-                        while True:
-                            block = src.read(1024 * 1024)
-                            if not block:
-                                break
-                            out.write(block)
-
         binary = joblib.load(binary_path)
         multiclass = joblib.load(mc_path)
         rul = joblib.load(rul_path)
-
         return binary, multiclass, rul, {
-            "binary": "2 (bundled)",
-            "multiclass": "1 (bundled)",
-            "rul": "1 (bundled)",
+            "binary": "bundled-final",
+            "multiclass": "bundled-final",
+            "rul": "bundled-final",
         }
     except Exception as e:
-        st.warning(f"Could not load bundled prediction models: {e}")
+        st.error(f"Could not load bundled prediction models: {e}")
         return None, None, None, {}
 
 
 @st.cache_resource(show_spinner=False)
 def load_registered_models(db_path):
-    # Streamlit Cloud: there is no local MLflow SQLite registry, so use the
-    # bundled model files immediately when the DB is not present.
-    if not db_path:
-        return _load_bundled_models()
-
-    # Local development: use the MLflow registry exactly as before.
-    if db_path:
-        try:
-            # The DB shipped with the project contains paths from the training PC.
-            # Rewrite those paths to the current app folder before MLflow resolves the aliases.
-            repair_mlflow_paths(db_path)
-            mlflow.set_tracking_uri(f"sqlite:///{db_path}")
-            client = mlflow.MlflowClient()
-
-            names = {
-                "binary": "failure_within_24h_classifier",
-                "multiclass": "failure_type_classifier",
-                "rul": "rul_hours_regressor",
-            }
-
-            models = {}
-            versions = {}
-
-            for key, name in names.items():
-                try:
-                    registered_versions = client.search_model_versions(f"name='{name}'")
-
-                    if not registered_versions:
-                        models[key] = None
-                        versions[key] = None
-                        continue
-
-                    # Use the latest registered version.
-                    latest_version = max(
-                        registered_versions,
-                        key=lambda v: int(v.version)
-                    )
-
-                    version = latest_version.version
-
-                    models[key] = mlflow.sklearn.load_model(
-                        f"models:/{name}/{version}"
-                    )
-
-                    versions[key] = version
-
-                except Exception as e:
-                    models[key] = None
-                    versions[key] = None
-                    st.warning(f"Could not load {name}: {e}")
-
-            if any(models.values()):
-                return models["binary"], models["multiclass"], models["rul"], versions
-
-        except Exception as e:
-            st.warning(f"MLflow registry unavailable; using bundled models instead. Details: {e}")
-
-    # Streamlit Cloud: no local SQLite registry is required.
+    """
+    The final GUI is self-contained: use the bundled, tested artifacts first.
+    MLflow is optional and is only used for the informational page when a local
+    tracking database is present.
+    """
     return _load_bundled_models()
 
 
 # --------------------------- Charts ---------------------------
+# IMPORTANT: This order comes from the LabelEncoder fitted in the training notebook.
+# LabelEncoder.classes_ was: bearing, electrical, hydraulic, motor_overheat, none.
+FAILURE_TYPE_CLASS_NAMES = [
+    "bearing",
+    "electrical",
+    "hydraulic",
+    "motor_overheat",
+    "none",
+]
+
 def align_prediction_features(df, expected_features):
     """
     Align live input with the exact feature schema expected by the trained model.
@@ -561,7 +453,7 @@ def align_prediction_features(df, expected_features):
     # One-hot categorical values when raw categorical columns are present.
     categorical_cols = [c for c in ["machine_type", "operating_mode"] if c in out.columns]
     if categorical_cols:
-        out = pd.get_dummies(out, columns=categorical_cols, dtype=int)
+        out = pd.get_dummies(out, columns=categorical_cols, drop_first=True, dtype=int)
 
     # Exact model schema: add missing columns and remove unexpected ones.
     out = out.reindex(columns=expected_features, fill_value=0)
@@ -733,6 +625,15 @@ if page == "Command Center":
 # ======================== LIVE PREDICTIONS ========================
 elif page == "Live Predictions":
     st.markdown('<div class="section-title">Live Machine Assessment</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="info-box">'
+        '<b>How to read the results:</b> the 24h classifier estimates the probability of the '
+        "failure within 24 hours using the project's deployment definition: <i>failure within 24h = 1</i> when "
+        '<i>RUL ≤ 24 h</i>. RUL is then shown as the continuous time estimate. This keeps the '
+        'headline risk decision and RUL logically consistent.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
     if df is None:
         st.warning("Load the project CSV first. The app uses the latest machine reading to build the engineered features needed by the trained models.")
@@ -776,8 +677,14 @@ elif page == "Live Predictions":
             submitted = st.form_submit_button("RUN CONDITION ASSESSMENT")
 
         if submitted:
-            # Build a one-row raw-ish frame, then reproduce feature engineering from the
-            # latest machine history. This avoids asking the operator for engineered fields.
+            # ------------------------------------------------------------------
+            # Build the live feature row using the SAME preprocessing/feature
+            # engineering sequence used by the training notebook.
+            #
+            # IMPORTANT: the live row is explicitly marked and selected AFTER feature engineering.
+            # This prevents timestamp ties from causing the app to predict on the
+            # historical latest row instead of the operator-entered values.
+            # ------------------------------------------------------------------
             history = machine_rows.copy()
             if "timestamp" in history.columns:
                 history["timestamp"] = pd.to_datetime(history["timestamp"], errors="coerce")
@@ -790,99 +697,195 @@ elif page == "Live Predictions":
                 row[k] = v
             row["machine_id"] = selected_machine
 
-            history = pd.concat([history, pd.DataFrame([row])], ignore_index=True)
+            # Explicitly mark the operator-entered row. Previously it inherited
+            # the exact same timestamp as the historical latest row. Because
+            # timestamp sorting can reorder ties, the app could select the old
+            # historical row instead of the values the operator entered.
+            row["_is_live_prediction"] = True
 
-            # Keep only the fields necessary for feature creation.
+            # Give the synthetic live observation a timestamp strictly after the
+            # historical latest reading so rolling/change features use it as the
+            # newest observation. The explicit marker below is still used to
+            # select the prediction row, so timestamp ties cannot break inference.
             if "timestamp" in history.columns:
                 history["timestamp"] = pd.to_datetime(history["timestamp"], errors="coerce")
-                history = history.sort_values("timestamp").reset_index(drop=True)
+                valid_ts = history["timestamp"].dropna()
+                if len(valid_ts):
+                    row["timestamp"] = valid_ts.max() + pd.Timedelta(seconds=1)
 
-            # Compute engineered fields exactly as in the notebook.
-            if "timestamp" in history.columns:
-                history["hour"] = history["timestamp"].dt.hour.fillna(pd.Timestamp.now().hour)
-                history["day_of_week"] = history["timestamp"].dt.dayofweek.fillna(pd.Timestamp.now().dayofweek)
-                history["month"] = history["timestamp"].dt.month.fillna(pd.Timestamp.now().month)
+            history = pd.concat([history, pd.DataFrame([row])], ignore_index=True)
 
-            sensors = ["vibration_rms", "temperature_motor", "current_phase_avg", "pressure_level", "rpm"]
-            for col in sensors:
-                if col in history.columns:
-                    history[f"{col}_change"] = history.groupby("machine_id")[col].diff().fillna(0)
+            # prepare_dataframe() reproduces the notebook's preprocessing:
+            # machine-wise median imputation, categorical one-hot encoding,
+            # time features, sensor changes, and rolling 5-reading means.
+            live_features = prepare_dataframe(history)
 
-            for col in ["vibration_rms", "temperature_motor", "pressure_level"]:
-                if col in history.columns:
-                    history[f"{col}_rolling_mean_5"] = (
-                        history.groupby("machine_id")[col]
-                               .transform(lambda x: x.rolling(5, min_periods=1).mean())
+            if len(live_features) == 0:
+                st.error("Could not build the live feature row.")
+            else:
+                # Select the live row by its explicit marker, never by position.
+                live_mask = live_features["_is_live_prediction"].fillna(False).astype(bool)
+                if not live_mask.any():
+                    st.error("Could not identify the live prediction row after feature engineering.")
+                else:
+                    live_index = live_features.index[live_mask][-1]
+                    candidate = live_features.loc[[live_index]].copy()
+                    candidate = candidate.drop(columns=["_is_live_prediction"], errors="ignore")
+
+                # Get each model's own feature schema. All three models were
+                # trained from the same engineered feature table, but using each
+                # model's recorded schema makes inference robust to future changes.
+                def model_features(model):
+                    if model is not None and hasattr(model, "feature_names_in_"):
+                        return list(model.feature_names_in_)
+                    return None
+
+                binary_features = model_features(binary_model)
+                mc_features = model_features(mc_model)
+                rul_features = model_features(rul_model)
+
+                if binary_features is None and mc_features is None and rul_features is None:
+                    st.error(
+                        "Registered MLflow models were not found or do not expose their feature schema. "
+                        "Run the notebook through the MLflow registration section first, then restart the app."
+                    )
+                else:
+                    # Build a separately aligned matrix for each model from the
+                    # fully engineered live row. This avoids accidentally using a
+                    # schema/feature set from a different model.
+                    X_binary = (
+                        align_prediction_features(candidate, binary_features)
+                        if binary_features is not None else None
+                    )
+                    X_mc = (
+                        align_prediction_features(candidate, mc_features)
+                        if mc_features is not None else None
+                    )
+                    X_r = (
+                        align_prediction_features(candidate, rul_features)
+                        if rul_features is not None else None
                     )
 
-            # Match notebook's one-hot encoding: create columns expected by the model.
-            model_features = None
-            for m in [binary_model, mc_model, rul_model]:
-                if m is not None and hasattr(m, "feature_names_in_"):
-                    model_features = list(m.feature_names_in_)
-                    break
+                    # Run all available models before rendering the cards so the
+                    # consistency check is based on the same live feature row.
+                    pred = None
+                    prob = None
+                    mc_pred = None
+                    label = None
+                    rul = None
 
-            if model_features is None:
-                st.error("Registered MLflow models were not found. Run the notebook through the MLflow registration section first, then restart the app.")
-            else:
-                # Encode categoricals without needing the original LabelEncoder object.
-                # The trained model's feature names determine the final one-hot columns.
-                candidate = history.iloc[[-1]].copy()
+                    if binary_model is not None and X_binary is not None:
+                        pred = int(binary_model.predict(X_binary)[0])
+                        prob = float(binary_model.predict_proba(X_binary)[0, 1])
 
-                # Align the live row with the exact feature schema used during training.
-                # This one-hot encodes categorical context before selecting model columns.
-                X_live = align_prediction_features(candidate, model_features)
-
-                p1, p2, p3 = st.columns(3)
-
-                # 1) Binary
-                with p1:
-                    if binary_model is not None:
-                        pred = int(binary_model.predict(X_live)[0])
-                        prob = float(binary_model.predict_proba(X_live)[0, 1])
-                        if pred == 1:
-                            st.markdown(f'<div class="status-danger">⚠ FAILURE RISK<br><span style="font-size:26px">{prob*100:.1f}%</span> probability within 24h</div>', unsafe_allow_html=True)
-                        else:
-                            st.markdown(f'<div class="status-ok">✓ NORMAL<br><span style="font-size:26px">{prob*100:.1f}%</span> failure probability</div>', unsafe_allow_html=True)
-                    else:
-                        st.warning("Binary model unavailable.")
-
-                # 2) Failure type
-                with p2:
-                    if mc_model is not None:
-                        mc_pred = mc_model.predict(X_live)[0]
+                    if mc_model is not None and X_mc is not None:
+                        mc_pred = mc_model.predict(X_mc)[0]
                         try:
-                            # Classes are shown in the project presentation.
-                            class_names = ["none", "bearing", "motor overheat", "hydraulic", "electrical"]
                             idx = int(mc_pred)
-                            label = class_names[idx] if idx < len(class_names) else str(mc_pred)
+                            # Exact LabelEncoder mapping from the training notebook:
+                            # 0=bearing, 1=electrical, 2=hydraulic,
+                            # 3=motor_overheat, 4=none.
+                            label = (
+                                FAILURE_TYPE_CLASS_NAMES[idx]
+                                if 0 <= idx < len(FAILURE_TYPE_CLASS_NAMES)
+                                else str(mc_pred)
+                            )
                         except Exception:
                             label = str(mc_pred)
-                        st.markdown(f'<div class="metric-card"><div class="metric-label">Predicted Failure Type</div><div class="metric-value">{label.title()}</div><div class="metric-sub">XGBoost multi-class</div></div>', unsafe_allow_html=True)
-                    else:
-                        st.warning("Multi-class model unavailable.")
 
-                # 3) RUL
-                with p3:
-                    if rul_model is not None:
-                        # RUL model may have the same feature set; use its own names.
-                        rf = list(rul_model.feature_names_in_) if hasattr(rul_model, "feature_names_in_") else model_features
-                        X_r = candidate.copy()
-                        X_r = align_prediction_features(X_r, rf).apply(pd.to_numeric, errors="coerce").fillna(0)
-                        # Convert all feature names explicitly to Python string type
-                        # to avoid the scikit-learn mixed feature-name error.
+                    if rul_model is not None and X_r is not None:
                         X_r.columns = [str(col) for col in X_r.columns]
-                        # Equivalent alternative: X_r.columns = X_r.columns.astype(str)
                         rul = max(0.0, float(rul_model.predict(X_r)[0]))
-                        st.markdown(f'<div class="metric-card"><div class="metric-label">Remaining Useful Life</div><div class="metric-value">{rul:.1f} h</div><div class="metric-sub">Random Forest regression</div></div>', unsafe_allow_html=True)
-                    else:
-                        st.warning("RUL model unavailable.")
 
-                st.markdown("### Input Signal Profile")
-                signal_cols = [c for c in numeric_inputs if c in values]
-                chart_df = pd.DataFrame({"Sensor": signal_cols, "Value": [values[c] for c in signal_cols]})
-                fig = px.bar(chart_df, x="Sensor", y="Value", title="Current Machine Sensor Inputs")
-                st.plotly_chart(fig_layout(fig, 330), use_container_width=True)
+                    p1, p2, p3 = st.columns(3)
+
+                    # 1) Binary failure risk
+                    with p1:
+                        if pred is not None and prob is not None:
+                            if pred == 1:
+                                st.markdown(
+                                    f'<div class="status-danger">⚠ FAILURE RISK<br>'
+                                    f'<span style="font-size:26px">{prob*100:.2f}%</span> probability within 24h</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.markdown(
+                                    f'<div class="status-ok">✓ NORMAL<br>'
+                                    f'<span style="font-size:26px">{prob*100:.2f}%</span> probability within 24h</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            st.caption(f"Raw classifier probability: {prob:.8f}")
+                        else:
+                            st.warning("Binary model unavailable.")
+
+                    # 2) Failure type
+                    with p2:
+                        if label is not None:
+                            # The multiclass model includes `none`. When the binary
+                            # classifier says no near-term failure, make that context
+                            # explicit rather than presenting a failure type as certain.
+                            if label == "none" or pred == 0:
+                                display_label = "No failure predicted"
+                                sub_label = f"Multi-class model: {label.replace('_', ' ').title()}"
+                            else:
+                                display_label = label.replace('_', ' ').title()
+                                sub_label = "XGBoost multi-class"
+
+                            st.markdown(
+                                f'<div class="metric-card"><div class="metric-label">Predicted Failure Type</div>'
+                                f'<div class="metric-value">{display_label}</div>'
+                                f'<div class="metric-sub">{sub_label}</div></div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.warning("Multi-class model unavailable.")
+
+                    # 3) RUL
+                    with p3:
+                        if rul is not None:
+                            st.markdown(
+                                f'<div class="metric-card"><div class="metric-label">Remaining Useful Life</div>'
+                                f'<div class="metric-value">{rul:.1f} h</div>'
+                                f'<div class="metric-sub">Random Forest regression</div></div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.warning("RUL model unavailable.")
+
+                    # ---------------- Prediction relationship ----------------
+                    # Deployment definition: the binary 24h target is derived from RUL <= 24h.
+                    # Therefore the two headline outputs are expected to agree in direction.
+                    if pred is not None and prob is not None and rul is not None:
+                        short_rul = rul <= 24.0
+                        classifier_failure = pred == 1
+
+                        if short_rul and classifier_failure:
+                            st.markdown(
+                                '<div class="consistency-ok"><b>✓ CONSISTENT RISK SIGNAL</b> · '
+                                'RUL is within 24h and the classifier flags failure within 24h.</div>',
+                                unsafe_allow_html=True,
+                            )
+                        elif (not short_rul) and (not classifier_failure):
+                            st.markdown(
+                                '<div class="consistency-ok"><b>✓ CONSISTENT NORMAL SIGNAL</b> · '
+                                'RUL is above 24h and the classifier does not flag failure within 24h.</div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                f'<div class="consistency-warning"><b>⚠ MODEL UNCERTAINTY</b><br>'
+                                f'24h failure probability: <b>{prob*100:.2f}%</b> · RUL: <b>{rul:.1f} h</b>.<br>'
+                                'The binary target is defined from RUL ≤ 24h, so this mismatch is a model disagreement '
+                                'near the decision boundary—not two different target definitions. Review the sensor inputs.'
+                                '</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                    st.markdown("### Input Signal Profile")
+                    signal_cols = [c for c in numeric_inputs if c in values]
+                    chart_df = pd.DataFrame({"Sensor": signal_cols, "Value": [values[c] for c in signal_cols]})
+                    fig = px.bar(chart_df, x="Sensor", y="Value", title="Current Machine Sensor Inputs")
+                    st.plotly_chart(fig_layout(fig, 330), use_container_width=True)
 
 # ============================ DATASET ============================
 elif page == "Dataset":
@@ -1068,8 +1071,8 @@ elif page == "Model Evaluation":
 
     c1, c2, c3, c4 = st.columns(4)
     with c1: metric_card("Best Model", "XGBoost")
-    with c2: metric_card("Recall", "98.9%")
-    with c3: metric_card("F1", "96.9%")
+    with c2: metric_card("Recall", "98.3%")
+    with c3: metric_card("F1", "98.2%")
     with c4: metric_card("Selection", "Recall → F1")
 
     st.markdown("### Multi-class Classification · Failure Type")
@@ -1092,7 +1095,7 @@ elif page == "Model Evaluation":
     ], columns=["Model", "Result", "MAE", "RMSE", "R²"])
     st.dataframe(reg, use_container_width=True)
 
-    st.info("Metric logic from the project: recall + F1 decide the binary classifier; macro recall + macro F1 decide the multi-class model; MAE + R² decide the RUL regressor.")
+    st.info("Deployment note: the 24h classifier target is defined as RUL ≤ 24h so the risk decision is consistent with the RUL output. Binary model metrics shown here are from this coherent deployment target.")
 
 # ============================ MLFLOW ============================
 elif page == "MLflow":
@@ -1126,9 +1129,9 @@ elif page == "MLflow":
 
     st.markdown("### Registered Model Registry")
     registry = pd.DataFrame([
-        ["failure_within_24h_classifier", "2", "XGBoost", "Binary classification", "Bundled for Cloud"],
-        ["failure_type_classifier", "1", "XGBoost", "5-class classification", "Bundled for Cloud"],
-        ["rul_hours_regressor", "1", "Random Forest", "RUL regression", "Bundled for Cloud"],
+        ["failure_within_24h_classifier", "final", "XGBoost", "Binary classification", "Bundled"],
+        ["failure_type_classifier", "final", "XGBoost", "5-class classification", "Bundled"],
+        ["rul_hours_regressor", "final", "Random Forest", "RUL regression", "Bundled"],
     ], columns=["Registered Model", "Version", "Model", "Task", "Deployment"])
     st.dataframe(registry, use_container_width=True, hide_index=True)
 
