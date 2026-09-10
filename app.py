@@ -571,7 +571,7 @@ def align_prediction_features(df, expected_features):
     # One-hot categorical values when raw categorical columns are present.
     categorical_cols = [c for c in ["machine_type", "operating_mode"] if c in out.columns]
     if categorical_cols:
-        out = pd.get_dummies(out, columns=categorical_cols, dtype=int)
+        out = pd.get_dummies(out, columns=categorical_cols, drop_first=True, dtype=int)
 
     # Exact model schema: add missing columns and remove unexpected ones.
     out = out.reindex(columns=expected_features, fill_value=0)
@@ -786,8 +786,14 @@ elif page == "Live Predictions":
             submitted = st.form_submit_button("RUN CONDITION ASSESSMENT")
 
         if submitted:
-            # Build a one-row raw-ish frame, then reproduce feature engineering from the
-            # latest machine history. This avoids asking the operator for engineered fields.
+            # ------------------------------------------------------------------
+            # Build the live feature row using the SAME preprocessing/feature
+            # engineering sequence used by the training notebook.
+            #
+            # IMPORTANT: do not take candidate = history.iloc[[-1]] before
+            # feature engineering. Doing that previously discarded the engineered
+            # columns and caused align_prediction_features() to fill them with 0.
+            # ------------------------------------------------------------------
             history = machine_rows.copy()
             if "timestamp" in history.columns:
                 history["timestamp"] = pd.to_datetime(history["timestamp"], errors="coerce")
@@ -800,169 +806,173 @@ elif page == "Live Predictions":
                 row[k] = v
             row["machine_id"] = selected_machine
 
+            # Append the operator's current reading as the newest observation.
             history = pd.concat([history, pd.DataFrame([row])], ignore_index=True)
 
-            # Keep only the fields necessary for feature creation.
-            if "timestamp" in history.columns:
-                history["timestamp"] = pd.to_datetime(history["timestamp"], errors="coerce")
-                history = history.sort_values("timestamp").reset_index(drop=True)
+            # prepare_dataframe() reproduces the notebook's preprocessing:
+            # machine-wise median imputation, categorical one-hot encoding,
+            # time features, sensor changes, and rolling 5-reading means.
+            live_features = prepare_dataframe(history)
 
-            # Compute engineered fields exactly as in the notebook.
-            if "timestamp" in history.columns:
-                history["hour"] = history["timestamp"].dt.hour.fillna(pd.Timestamp.now().hour)
-                history["day_of_week"] = history["timestamp"].dt.dayofweek.fillna(pd.Timestamp.now().dayofweek)
-                history["month"] = history["timestamp"].dt.month.fillna(pd.Timestamp.now().month)
+            if len(live_features) == 0:
+                st.error("Could not build the live feature row.")
+            else:
+                candidate = live_features.iloc[[-1]].copy()
 
-            sensors = ["vibration_rms", "temperature_motor", "current_phase_avg", "pressure_level", "rpm"]
-            for col in sensors:
-                if col in history.columns:
-                    history[f"{col}_change"] = history.groupby("machine_id")[col].diff().fillna(0)
+                # Get each model's own feature schema. All three models were
+                # trained from the same engineered feature table, but using each
+                # model's recorded schema makes inference robust to future changes.
+                def model_features(model):
+                    if model is not None and hasattr(model, "feature_names_in_"):
+                        return list(model.feature_names_in_)
+                    return None
 
-            for col in ["vibration_rms", "temperature_motor", "pressure_level"]:
-                if col in history.columns:
-                    history[f"{col}_rolling_mean_5"] = (
-                        history.groupby("machine_id")[col]
-                               .transform(lambda x: x.rolling(5, min_periods=1).mean())
+                binary_features = model_features(binary_model)
+                mc_features = model_features(mc_model)
+                rul_features = model_features(rul_model)
+
+                if binary_features is None and mc_features is None and rul_features is None:
+                    st.error(
+                        "Registered MLflow models were not found or do not expose their feature schema. "
+                        "Run the notebook through the MLflow registration section first, then restart the app."
+                    )
+                else:
+                    # Build a separately aligned matrix for each model from the
+                    # fully engineered live row. This avoids accidentally using a
+                    # schema/feature set from a different model.
+                    X_binary = (
+                        align_prediction_features(candidate, binary_features)
+                        if binary_features is not None else None
+                    )
+                    X_mc = (
+                        align_prediction_features(candidate, mc_features)
+                        if mc_features is not None else None
+                    )
+                    X_r = (
+                        align_prediction_features(candidate, rul_features)
+                        if rul_features is not None else None
                     )
 
-            # Match notebook's one-hot encoding: create columns expected by the model.
-            model_features = None
-            for m in [binary_model, mc_model, rul_model]:
-                if m is not None and hasattr(m, "feature_names_in_"):
-                    model_features = list(m.feature_names_in_)
-                    break
+                    # Run all available models before rendering the cards so the
+                    # consistency check is based on the same live feature row.
+                    pred = None
+                    prob = None
+                    mc_pred = None
+                    label = None
+                    rul = None
 
-            if model_features is None:
-                st.error("Registered MLflow models were not found. Run the notebook through the MLflow registration section first, then restart the app.")
-            else:
-                # Encode categoricals without needing the original LabelEncoder object.
-                # The trained model's feature names determine the final one-hot columns.
-                candidate = history.iloc[[-1]].copy()
+                    if binary_model is not None and X_binary is not None:
+                        pred = int(binary_model.predict(X_binary)[0])
+                        prob = float(binary_model.predict_proba(X_binary)[0, 1])
 
-                # Align the live row with the exact feature schema used during training.
-                # This one-hot encodes categorical context before selecting model columns.
-                X_live = align_prediction_features(candidate, model_features)
-
-                # Run all three models first so the UI can check whether their
-                # outputs agree before presenting the assessment.
-                pred = None
-                prob = None
-                mc_pred = None
-                label = None
-                rul = None
-
-                if binary_model is not None:
-                    pred = int(binary_model.predict(X_live)[0])
-                    prob = float(binary_model.predict_proba(X_live)[0, 1])
-
-                if mc_model is not None:
-                    mc_pred = mc_model.predict(X_live)[0]
-                    try:
-                        idx = int(mc_pred)
-                        label = (
-                            FAILURE_TYPE_CLASS_NAMES[idx]
-                            if 0 <= idx < len(FAILURE_TYPE_CLASS_NAMES)
-                            else str(mc_pred)
-                        )
-                    except Exception:
-                        label = str(mc_pred)
-
-                if rul_model is not None:
-                    # RUL model may have the same feature set; use its own names.
-                    rf = list(rul_model.feature_names_in_) if hasattr(rul_model, "feature_names_in_") else model_features
-                    X_r = candidate.copy()
-                    X_r = align_prediction_features(X_r, rf).apply(pd.to_numeric, errors="coerce").fillna(0)
-                    X_r.columns = [str(col) for col in X_r.columns]
-                    rul = max(0.0, float(rul_model.predict(X_r)[0]))
-
-                p1, p2, p3 = st.columns(3)
-
-                # 1) Binary failure risk
-                with p1:
-                    if pred is not None and prob is not None:
-                        if pred == 1:
-                            st.markdown(
-                                f'<div class="status-danger">⚠ FAILURE RISK<br>'
-                                f'<span style="font-size:26px">{prob*100:.2f}%</span> probability within 24h</div>',
-                                unsafe_allow_html=True,
+                    if mc_model is not None and X_mc is not None:
+                        mc_pred = mc_model.predict(X_mc)[0]
+                        try:
+                            idx = int(mc_pred)
+                            # Exact LabelEncoder mapping from the training notebook:
+                            # 0=bearing, 1=electrical, 2=hydraulic,
+                            # 3=motor_overheat, 4=none.
+                            label = (
+                                FAILURE_TYPE_CLASS_NAMES[idx]
+                                if 0 <= idx < len(FAILURE_TYPE_CLASS_NAMES)
+                                else str(mc_pred)
                             )
-                        else:
-                            st.markdown(
-                                f'<div class="status-ok">✓ NORMAL<br>'
-                                f'<span style="font-size:26px">{prob*100:.2f}%</span> probability within 24h</div>',
-                                unsafe_allow_html=True,
-                            )
+                        except Exception:
+                            label = str(mc_pred)
+
+                    if rul_model is not None and X_r is not None:
+                        X_r.columns = [str(col) for col in X_r.columns]
+                        rul = max(0.0, float(rul_model.predict(X_r)[0]))
+
+                    p1, p2, p3 = st.columns(3)
+
+                    # 1) Binary failure risk
+                    with p1:
+                        if pred is not None and prob is not None:
+                            if pred == 1:
+                                st.markdown(
+                                    f'<div class="status-danger">⚠ FAILURE RISK<br>'
+                                    f'<span style="font-size:26px">{prob*100:.2f}%</span> probability within 24h</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.markdown(
+                                    f'<div class="status-ok">✓ NORMAL<br>'
+                                    f'<span style="font-size:26px">{prob*100:.2f}%</span> probability within 24h</div>',
+                                    unsafe_allow_html=True,
+                                )
                             st.caption(f"Raw classifier probability: {prob:.8f}")
-                    else:
-                        st.warning("Binary model unavailable.")
-
-                # 2) Failure type
-                with p2:
-                    if label is not None:
-                        # The multiclass model includes `none`. When the binary
-                        # classifier says no near-term failure, make that context
-                        # explicit instead of implying a confirmed failure type.
-                        if label == "none" or pred == 0:
-                            display_label = "No failure predicted"
-                            sub_label = f"Multi-class model: {label.replace('_', ' ').title()}"
                         else:
-                            display_label = label.replace('_', ' ').title()
-                            sub_label = "XGBoost multi-class"
+                            st.warning("Binary model unavailable.")
 
-                        st.markdown(
-                            f'<div class="metric-card"><div class="metric-label">Predicted Failure Type</div>'
-                            f'<div class="metric-value">{display_label}</div>'
-                            f'<div class="metric-sub">{sub_label}</div></div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        st.warning("Multi-class model unavailable.")
+                    # 2) Failure type
+                    with p2:
+                        if label is not None:
+                            # The multiclass model includes `none`. When the binary
+                            # classifier says no near-term failure, make that context
+                            # explicit rather than presenting a failure type as certain.
+                            if label == "none" or pred == 0:
+                                display_label = "No failure predicted"
+                                sub_label = f"Multi-class model: {label.replace('_', ' ').title()}"
+                            else:
+                                display_label = label.replace('_', ' ').title()
+                                sub_label = "XGBoost multi-class"
 
-                # 3) RUL
-                with p3:
-                    if rul is not None:
-                        st.markdown(
-                            f'<div class="metric-card"><div class="metric-label">Remaining Useful Life</div>'
-                            f'<div class="metric-value">{rul:.1f} h</div>'
-                            f'<div class="metric-sub">Random Forest regression</div></div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        st.warning("RUL model unavailable.")
+                            st.markdown(
+                                f'<div class="metric-card"><div class="metric-label">Predicted Failure Type</div>'
+                                f'<div class="metric-value">{display_label}</div>'
+                                f'<div class="metric-sub">{sub_label}</div></div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.warning("Multi-class model unavailable.")
 
-                # ---------------- Model consistency check ----------------
-                # The binary target is explicitly "failure within 24h", while RUL
-                # is an independent regression model. They can disagree, so do not
-                # overwrite either model's output. Instead, surface the disagreement.
-                if pred is not None and prob is not None and rul is not None:
-                    rul_implies_failure_24h = rul <= 24.0
-                    classifier_implies_failure_24h = pred == 1
+                    # 3) RUL
+                    with p3:
+                        if rul is not None:
+                            st.markdown(
+                                f'<div class="metric-card"><div class="metric-label">Remaining Useful Life</div>'
+                                f'<div class="metric-value">{rul:.1f} h</div>'
+                                f'<div class="metric-sub">Random Forest regression</div></div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.warning("RUL model unavailable.")
 
-                    if rul_implies_failure_24h != classifier_implies_failure_24h:
-                        st.markdown(
-                            f'<div class="consistency-warning">'
-                            f'<b>⚠ MODEL DISAGREEMENT</b><br>'
-                            f'24h classifier: <b>{prob*100:.2f}%</b> failure probability · '
-                            f'RUL model: <b>{rul:.1f} h</b> remaining.<br>'
-                            f'The models are predicting different near-term risk states. '
-                            f'Treat this case as requiring review rather than as a single definitive prediction.'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        state = "failure risk within 24h" if classifier_implies_failure_24h else "no failure within 24h"
-                        st.markdown(
-                            f'<div class="consistency-ok">'
-                            f'<b>✓ MODELS CONSISTENT</b> · Both models indicate <b>{state}</b>.'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
+                    # ---------------- Model consistency check ----------------
+                    # Keep the disagreement logic: the binary model predicts
+                    # failure within 24h, while RUL predicts remaining hours.
+                    # A disagreement is surfaced rather than silently overriding
+                    # either model.
+                    if pred is not None and prob is not None and rul is not None:
+                        rul_implies_failure_24h = rul <= 24.0
+                        classifier_implies_failure_24h = pred == 1
 
-                st.markdown("### Input Signal Profile")
-                signal_cols = [c for c in numeric_inputs if c in values]
-                chart_df = pd.DataFrame({"Sensor": signal_cols, "Value": [values[c] for c in signal_cols]})
-                fig = px.bar(chart_df, x="Sensor", y="Value", title="Current Machine Sensor Inputs")
-                st.plotly_chart(fig_layout(fig, 330), use_container_width=True)
+                        if rul_implies_failure_24h != classifier_implies_failure_24h:
+                            st.markdown(
+                                f'<div class="consistency-warning">'
+                                f'<b>⚠ MODEL DISAGREEMENT</b><br>'
+                                f'24h classifier: <b>{prob*100:.2f}%</b> failure probability · '
+                                f'RUL model: <b>{rul:.1f} h</b> remaining.<br>'
+                                f'The models are predicting different near-term risk states. '
+                                f'Treat this case as requiring review rather than as a single definitive prediction.'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            state = "failure risk within 24h" if classifier_implies_failure_24h else "no failure within 24h"
+                            st.markdown(
+                                f'<div class="consistency-ok">'
+                                f'<b>✓ MODELS CONSISTENT</b> · Both models indicate <b>{state}</b>.'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                    st.markdown("### Input Signal Profile")
+                    signal_cols = [c for c in numeric_inputs if c in values]
+                    chart_df = pd.DataFrame({"Sensor": signal_cols, "Value": [values[c] for c in signal_cols]})
+                    fig = px.bar(chart_df, x="Sensor", y="Value", title="Current Machine Sensor Inputs")
+                    st.plotly_chart(fig_layout(fig, 330), use_container_width=True)
 
 # ============================ DATASET ============================
 elif page == "Dataset":
